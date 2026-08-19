@@ -270,18 +270,45 @@ gen_ai.tool.call.result   = {"node":{"type":1,"ctor":2,"ctorName":"fk","children
 
 # Tier 2 — investigation and context
 
+> ### Read this before the next two sections
+>
+> `invoke_agent` and `chat / panel/editAgent` carry **the same field names** and are easily
+> confused. They are not variants of one record — they answer different questions, and one field
+> in particular means something completely different in each:
+>
+> | | `invoke_agent` | `chat / panel/editAgent` |
+> |---|---|---|
+> | Count | 1 per turn (trace root) | 6 per turn (children) |
+> | **`gen_ai.input.messages`** | **the user's typed prompt**, ~150 chars | **what was actually sent to the model** — avg 27,573 chars, max 56,435 |
+> | `copilot_chat.user_request` | clean prose, no wrappers | JSON array with `<context>` / `<editorContext>` |
+> | `usage.input_tokens` | turn total (112,335) | per-iteration (17,668) |
+> | Repository attributes | **only here** | absent |
+> | Arrives | end of turn only (431 s) | progressively, first at ~4 s |
+> | Real content after bloat | **657 chars** | ~32 KB |
+>
+> **In one line:** `invoke_agent` tells you what was *asked*; `panel/editAgent` tells you what was
+> *sent* and why the agent acted. Use the first for triage and repository context, the second for
+> exposure scoping and injection investigation.
+
 ## `chat` / panel/editAgent (span)
 
-**What it is.** One LLM call per iteration of the agent loop — the agent's reasoning steps between
-the user's request and its actions.
+**What it is.** One LLM call per iteration of the agent loop — the agent's reasoning between the
+user's request and its actions.
 
-**How it comes through.** Trace span, child of `invoke_agent`, one per turn. The richest and
-largest record in the feed at ~107 KB per span. **[content]**
+**The distinguishing property.** `gen_ai.input.messages` here is **not** the user's prompt. It is
+the complete payload transmitted to the model: injected editor context, workspace state, and the
+file contents that tool results fed back into the conversation. Averaged **27,573 characters**
+across 12 spans, peaking at **56,435**. This is the only record that answers *what source code left
+the building* — `invoke_agent` cannot, because it holds only what the user typed.
 
-**Quality: good content, poor economics.** **81%** of each span is two static, repeated
-attributes (`gen_ai.tool.definitions` ~60 KB, `gen_ai.system_instructions` ~26 KB). The real
-payload — prompt, injected workspace context, model reasoning — is ~20 KB. Strip the static
-attributes and this becomes affordable to retain in full.
+**How it comes through.** Trace span, child of `invoke_agent`. Emitted per iteration, so these
+**stream out during the turn** — the first landed seven minutes before `invoke_agent` closed. Your
+only in-flight visibility into the LLM side. **[content]**
+
+**Quality: good content, poor economics.** Measured across 12 spans: **77%** is two static,
+repeated attributes — `gen_ai.tool.definitions` (avg 81,814 chars) and `gen_ai.system_instructions`
+(avg 25,036). Strip those two and a span drops from ~138 KB to **~32 KB**, of which 27 KB is the
+prompt you want. That single change makes retaining all six reasoning spans per turn affordable.
 
 ```
 name = chat mai-code-1.1-flash    duration = 3978ms   parent = invoke_agent
@@ -327,14 +354,23 @@ gen_ai.usage.input_tokens  = 17668
 
 ## `invoke_agent` (span)
 
-**What it is.** The session envelope — one per user request in agent mode. What was asked, what
-was delivered.
+**What it is.** The session envelope — one per user request. What was asked, what was delivered.
+
+**The distinguishing property.** Two things exist only here. First, `copilot_chat.user_request` is
+the user's words **clean** — no `<context>` wrappers, no injected workspace state, none of the
+noise that makes the same field unusable on `panel/editAgent`. That makes it the single best field
+in the feed for acceptable-use policy matching. Second, the **repository attributes**
+(`github.copilot.git.repository`, `.branch`, `.commit_sha`, `github.org`) appear on this span and
+**no other** — so every child-span alert must join back here via `traceId` to learn which
+repository it concerned.
 
 **How it comes through.** Root span of the trace, emitted **only at end of turn** — 431 seconds in
-this session. Useless for real-time detection; ideal as the case-summary record. **[content]**
+the observed session, by which time every action has already executed. Unusable for real-time
+detection; ideal as the case-summary record. **[content]**
 
 **Quality: good, but 99% bloat.** 60,830 of its 61,487 characters are `tool.definitions`,
-delivering **657 characters** of actual content.
+delivering **657 characters** of actual content — the cheapest span in the feed once that one
+attribute is stripped.
 
 ```
 copilot_chat.user_request = Read README.md and create hello.py that prints the first heading then run it
