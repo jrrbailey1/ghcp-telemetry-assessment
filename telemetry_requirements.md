@@ -759,6 +759,162 @@ classification, which Copilot does not emit.
 
 ---
 
+## 9. SIEM ingest — format, effort and required normalisation
+
+Measured across all four capture sessions: **599 flush documents, 52 spans, 57 log records.**
+
+### 9.1 Wire format
+
+OTLP/HTTP with protobuf-JSON encoding. The file exporter writes **one complete OTLP document per
+flush**, giving JSON-lines — but each line is a whole batch, not one event.
+
+The shape is deeply nested and attributes are key/value *arrays*, not objects:
+
+```json
+{"resourceSpans":[{
+  "resource":{"attributes":[{"key":"service.name","value":{"stringValue":"copilot-chat"}}]},
+  "scopeSpans":[{"scope":{"name":"copilot-chat","version":"0.51.0"},
+    "spans":[{"traceId":"3b4a…","spanId":"909b…","name":"execute_tool run_in_terminal",
+      "startTimeUnixNano":"1787051419912000000",
+      "attributes":[{"key":"gen_ai.operation.name","value":{"stringValue":"execute_tool"}}]}]}]}]}
+```
+
+Four structural properties make this hostile to naive ingest:
+
+1. **Events are four levels deep** — `resourceSpans[] → scopeSpans[] → spans[]`. One line can carry
+   many events.
+2. **Attributes are arrays of `{key, value:{typedValue}}`**, so every field needs projection before
+   it is queryable. No SIEM will index `attributes[7].value.stringValue` usefully.
+3. **Resource attributes live in a different branch** from span attributes and must be joined onto
+   each event during flattening, or you lose `service.name`, `session.id` and any identity
+   enrichment.
+4. **Typed value wrappers.** Observed across the captures: `stringValue` ×642, `intValue` ×238,
+   `arrayValue` ×28, `doubleValue` ×16. Per proto3 JSON mapping, **`intValue` arrives as a
+   quoted string**, so token counts and durations need explicit numeric coercion or they land as
+   text and cannot be aggregated.
+
+### 9.2 Size profile versus common platform limits
+
+| Measure | Observed |
+|---|---|
+| Mean document | 13,173 bytes |
+| **Max document** | **656,250 bytes** |
+| Documents over 10 KB | 31 of 599 |
+| Documents over 32 KB | 12 of 599 |
+| Max total attribute bytes on one span | 192,944 |
+
+Largest individual attribute values:
+
+| Attribute | Max observed |
+|---|---|
+| `gen_ai.tool.definitions` | **105,748** |
+| `gen_ai.input.messages` | **56,435** |
+| `gen_ai.system_instructions` | 26,159 |
+| `copilot_chat.user_request` | 10,549 |
+| `gen_ai.output.messages` | 4,769 |
+| `gen_ai.tool.call.result` | 4,293 |
+
+Check these against your platform's defaults before assuming the data lands intact. Typical
+defaults worth verifying in your own deployment:
+
+- **Splunk** — `TRUNCATE` in `props.conf` defaults to **10,000 bytes per event**. 31 of our 599
+  documents exceed that, and the largest is 65× over. Ingested with defaults, most of every agent
+  turn is silently discarded at index time.
+- **Microsoft Sentinel / Log Analytics** — field values are capped around **32 KB** and truncated
+  beyond it. `gen_ai.tool.definitions` and `gen_ai.input.messages` both exceed this.
+- **Elasticsearch** — dynamic mapping applies `ignore_above: 256` to keyword fields, so long values
+  become unsearchable unless mapped as `text`; the default `index.mapping.total_fields.limit` of
+  1,000 is a risk given how many distinct attribute keys appear.
+
+**The practical consequence:** with default settings on at least one major platform, the prompt and
+tool-definition content is lost at ingest — silently, and in a way that looks like successful
+collection.
+
+### 9.3 Data-quality problems that must be fixed in the pipeline
+
+**Double-encoded JSON.** Eleven attributes carry a JSON document *inside* a string value, requiring
+a second parse:
+
+```
+gen_ai.input.messages          32/32      gen_ai.tool.definitions        16/16
+gen_ai.output.messages         32/32      gen_ai.tool.call.arguments     13/13
+gen_ai.system_instructions     28/28      copilot_chat.request.options   28/28
+gen_ai.response.finish_reasons 28/28      copilot_chat.request.shape     28/28
+```
+
+**Polymorphic fields — the worst of it.** Two attributes are *sometimes* JSON and *sometimes* plain
+text, with nothing in the record to distinguish them:
+
+```
+copilot_chat.user_request      12/32 occurrences are JSON, 20 are plain prose
+gen_ai.tool.call.result         6/13 occurrences are JSON, 7 are plain text
+```
+
+A parser that assumes either form breaks on the other. Both must be sniffed at parse time.
+
+**Internal serialisation in `tool.call.result`.** The JSON form is VS Code's render tree with
+minified class names (`_Me`, `wn`, `y6e`, `fk`) that change between builds. Recovering the actual
+file content means walking the tree for `text` nodes — see `tools/flatten.ps1`.
+
+**Unwrapped array values.** `gen_ai.response.finish_reasons` arrives as
+`{"arrayValue":{"values":[{"stringValue":"stop"}]}}` rather than `["stop"]`.
+
+**No severity.** All 57 log records carry empty `severityText` and `severityNumber`, so
+SIEM-native severity triage is unavailable and must be derived.
+
+**Nanosecond epoch strings.** `startTimeUnixNano: "1787051419912000000"` needs conversion; most
+platforms will not auto-detect it as a timestamp.
+
+**Intermittent trace correlation.** `gen_ai.client.inference.operation.details` carries trace
+context on only 15 of 28 records, correlating with model rather than at random — auxiliary
+`gpt-4o-mini` calls mostly lack it. Any join must fall back to `gen_ai.response.id`.
+
+**A broken counter.** `tool_call_count` is `0` on all 12 `agent.turn` records despite tool calls
+occurring. Derive tool counts from `copilot_chat.tool.call` events instead.
+
+### 9.4 Required normalisation pipeline
+
+In order. Steps 1–6 are mandatory for the data to be usable at all.
+
+1. **Flatten** `resourceSpans → scopeSpans → spans` to one record per event, merging resource
+   attributes onto each.
+2. **Project** the `{key,value}` attribute arrays into flat fields.
+3. **Coerce types** — `intValue` strings to numbers, nanosecond epochs to ISO-8601.
+4. **Unwrap** `arrayValue` structures to plain arrays.
+5. **Decode** the eleven double-encoded attributes, sniffing type on the two polymorphic ones.
+6. **Extract text** from render-tree tool results.
+7. **Strip static bloat** — dropping `gen_ai.tool.definitions` and `gen_ai.system_instructions`, or
+   emitting them once per session, removes **76% of span payload** (589 KB of 775 KB measured) and
+   brings every remaining document under typical field limits. This single step resolves most of
+   §9.2.
+8. **Derive severity** — a defensible mapping is `execute_hook` with `decision=block` → high;
+   `run_in_terminal` and `fetch_webpage` → medium; everything else → informational.
+9. **Enrich identity** — `enduser.id` and `host.name` (G1, G2); repository context is only on
+   `invoke_agent`, so join child spans to the parent via `traceId` (G8).
+10. **Normalise tool parameters** for the tools GitHub gave no flat attribute — `fetch_webpage`,
+    `github_repo`, `install_extension`, `run_vscode_command` — so detection coverage does not
+    depend on which tools happened to get convenience fields (G18).
+11. **Route large content separately.** Keep prompts and file contents in object storage keyed by
+    `traceId`/`spanId`, and index only a pointer plus a hash. Preserves investigative access
+    without paying per-GB SIEM ingest on 100 KB fields.
+
+### 9.5 Effort assessment
+
+| Aspect | Verdict |
+|---|---|
+| Transport | **Easy.** OTLP is natively supported by every major SIEM, directly or via an OTel collector |
+| Schema | **Moderate.** `gen_ai.*` follows OpenTelemetry GenAI semantic conventions, so field names are standard and portable |
+| Parsing | **Hard.** Four-level nesting, key/value arrays, eleven double-encoded fields, two polymorphic, one leaking internal serialisation |
+| Sizing | **Hard by default, easy after step 7.** Dropping two static attributes removes 76% of volume |
+| Usability as delivered | **Not directly ingestible.** Requires a transformation stage; pointing a SIEM at the raw feed produces unqueryable or silently truncated records |
+
+**Bottom line for a SOC.** The transport and the schema are the easy parts — this is standards-based
+telemetry, not a proprietary format, and that is worth a great deal. The work is a normalisation
+layer between collector and SIEM: roughly the eleven steps above, of which flattening, decoding and
+bloat-stripping carry most of the value. Budget this as a real engineering deliverable rather than
+a configuration exercise, and **build it before measuring ingest cost**, because step 7 alone
+changes the volume by a factor of four.
+
 ## Appendix A — Observed attribute schema (Copilot v0.51.0)
 
 **Resource** — `service.name`, `service.version`, `session.id`
