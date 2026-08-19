@@ -1,0 +1,87 @@
+# glasseye - LOCAL E2E TEST pipeline.
+#
+# Derived from config.yaml. Differences, and why:
+#   1. No googlecloudpubsub exporter / traces/pubsub pipeline.
+#      CORRECTION (2026-08-19): an earlier version of this comment claimed the
+#      exporter aborts collector startup without credentials. That was wrong -
+#      tested directly, config.yaml starts fine with no GCP credentials and the
+#      exporter silently drops messages, exactly as the README says.
+#      The real and only reason this pipeline is replaced: with output going to
+#      Pub/Sub there is no way to OBSERVE what filter/soc passes. A local sink
+#      is required to measure the filter's behaviour - see (2).
+#   2. traces/soc runs the same resource -> filter/soc -> batch chain but
+#      exports to ./agent-traffic-soc.json instead of Pub/Sub. Diffing that
+#      against agent-traffic.json shows exactly which spans the SOC filter
+#      keeps and which it drops, with no GCP dependency.
+#   3. Listeners bound to 127.0.0.1 rather than 0.0.0.0: VS Code connects over
+#      loopback, and this avoids a Windows Defender firewall prompt plus
+#      exposing the collector to the LAN.
+#
+# Run from the repo root so the relative ./agent-traffic*.json paths land here:
+#   .\collector\glasseye.exe --config config.local.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+        # Expose the incoming request context (incl. client IP) to processors.
+        # Required for the resource/client_addr processor's from_context lookup.
+        include_metadata: true
+      grpc:
+        endpoint: 127.0.0.1:4317
+        include_metadata: true
+
+processors:
+  # resource/client_addr: stamps the OTLP source IP onto every signal's
+  # resource block as "client.address". Requires include_metadata:true above.
+  resource/client_addr:
+    attributes:
+      - key: client.address
+        from_context: client.address
+        action: upsert
+  batch:
+  # filter/soc: drops spans that are NOT SOC-relevant. Unchanged from
+  # config.yaml so the production condition is what gets tested.
+  filter/soc:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["gen_ai.operation.name"] != "invoke_agent" and attributes["gen_ai.operation.name"] != "execute_tool" and attributes["gen_ai.agent.name"] != "copilotLanguageModelWrapper" and attributes["gen_ai.agent.name"] != "InlineChat2Intent"'
+
+exporters:
+  debug:
+    verbosity: detailed
+  # Unfiltered capture: everything the collector receives, all three signals.
+  file:
+    path: ./agent-traffic.json
+  # SOC-filtered capture: stands in for the Pub/Sub leg during local testing.
+  file/soc:
+    path: ./agent-traffic-soc.json
+
+service:
+  telemetry:
+    logs:
+      level: info
+      disable_stacktrace: true
+    # Empty readers list suppresses the default localhost:8888 Prometheus
+    # listener for the collector's own internal metrics.
+    metrics:
+      level: none
+      readers: []
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]
+    traces/soc:
+      receivers: [otlp]
+      processors: [resource/client_addr, filter/soc, batch]
+      exporters: [file/soc]
+    metrics:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]
+    logs:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]

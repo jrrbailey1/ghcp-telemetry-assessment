@@ -1,0 +1,84 @@
+# glasseye - LOCAL config with a CORRECTED filter/soc condition.
+#
+# Identical to config.local.yaml except for the filter/soc OTTL expression.
+# Written to demonstrate the fix without modifying either config.yaml (production)
+# or config.local.yaml (the as-is baseline), so a before/after comparison is possible.
+#
+# The production condition in config.yaml keeps only four values and drops everything
+# else. Testing showed it silently discards three categories of security-relevant span:
+#
+#   1. execute_hook       - policy decisions, including decision=block. The only
+#                           ENFORCED control event Copilot emits.
+#   2. embeddings         - workspace code sent to an embedding model. A data-egress
+#                           path with no other record anywhere in the telemetry.
+#   3. panel/editAgent    - the agent reasoning turns (see telemetry_requirements.md G6).
+#
+# The corrected condition below adds execute_hook and embeddings, and continues to
+# drop genuine housekeeping (progressMessages, title). panel/editAgent is left OUT
+# deliberately - it is 81% static bloat, and the right fix there is attribute
+# stripping rather than whole-span admission. See G12.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+        include_metadata: true
+      grpc:
+        endpoint: 127.0.0.1:4317
+        include_metadata: true
+
+processors:
+  resource/client_addr:
+    attributes:
+      - key: client.address
+        from_context: client.address
+        action: upsert
+  batch:
+  # CORRECTED: drop a span only if it is none of the operations we care about.
+  # Reads as: "not invoke_agent AND not execute_tool AND not execute_hook AND
+  #            not embeddings AND not a risk-verdict agent" -> drop it.
+  filter/soc:
+    error_mode: ignore
+    traces:
+      span:
+        - >-
+          attributes["gen_ai.operation.name"] != "invoke_agent"
+          and attributes["gen_ai.operation.name"] != "execute_tool"
+          and attributes["gen_ai.operation.name"] != "execute_hook"
+          and attributes["gen_ai.operation.name"] != "embeddings"
+          and attributes["gen_ai.agent.name"] != "copilotLanguageModelWrapper"
+          and attributes["gen_ai.agent.name"] != "InlineChat2Intent"
+
+exporters:
+  debug:
+    verbosity: detailed
+  file:
+    path: ./agent-traffic.json
+  file/soc:
+    path: ./agent-traffic-soc.json
+
+service:
+  telemetry:
+    logs:
+      level: info
+      disable_stacktrace: true
+    metrics:
+      level: none
+      readers: []
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]
+    traces/soc:
+      receivers: [otlp]
+      processors: [resource/client_addr, filter/soc, batch]
+      exporters: [file/soc]
+    metrics:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]
+    logs:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]

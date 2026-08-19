@@ -1,0 +1,108 @@
+# glasseye pipeline.
+#   - otlp receiver listens on all interfaces, standard OTLP/HTTP (:4318) and
+#     OTLP/gRPC (:4317). VS Code's Copilot `otlp-http` exporter (default) POSTs
+#     to http://localhost:4318/v1/{traces,metrics,logs}; `otlp-grpc` hits :4317.
+#   - batch processor coalesces signals for the exporter.
+#   - debug exporter with verbosity=detailed prints every span, metric, and log
+#     record (with attributes) to stdout. This is the "just output what it
+#     receives" stage.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        # Expose the incoming request context (incl. client IP) to processors.
+        # Required for the resource/client_addr processor's from_context lookup.
+        include_metadata: true
+      grpc:
+        endpoint: 0.0.0.0:4317
+        include_metadata: true
+
+processors:
+  # resource/client_addr: stamps the OTLP source IP (the address the incoming
+  # HTTP/gRPC request connected from) onto every signal's resource block as
+  # "client.address". Requires include_metadata:true on the OTLP receiver.
+  # Runs first in every pipeline so all downstream exporters benefit.
+  resource/client_addr:
+    attributes:
+      - key: client.address
+        from_context: client.address
+        action: upsert
+  batch:
+  # filter/soc: runs only in the traces/pubsub pipeline. Drops spans that are
+  # NOT SOC-relevant (housekeeping: progressMessages, backgroundTodoAgent,
+  # title, healApplyPatch, plain chat spans without tools). Keeps:
+  # invoke_agent (prompts), execute_tool (tool calls), and
+  # copilotLanguageModelWrapper (risk verdicts). The debug+file pipelines
+  # are unfiltered and receive everything.
+  filter/soc:
+    error_mode: ignore
+    traces:
+      span:
+        # Drop if the span is not one we want. Each condition is OR'd:
+        # any match = drop the span. We list what to EXCLUDE.
+        - 'attributes["gen_ai.operation.name"] != "invoke_agent" and attributes["gen_ai.operation.name"] != "execute_tool" and attributes["gen_ai.agent.name"] != "copilotLanguageModelWrapper" and attributes["gen_ai.agent.name"] != "InlineChat2Intent"'
+
+exporters:
+  debug:
+    verbosity: detailed
+    # sampling_initial and sampling_thereafter throttle the debug exporter's
+    # own logs; left at defaults so nothing is dropped during local debugging.
+  # file exporter writes one OTLP JSON document per flush to a single file, so
+  # the captured Copilot agent traffic can be scrolled/greped independently of
+  # the live stdout. Each line is a JSON object with a top-level "resource*"
+  # key (resourceSpans / resourceMetrics / resourceLogs). Path is relative to
+  # the collector's CWD; rotate manually by deleting/truncating the file.
+  file:
+    path: ./agent-traffic.json
+  # Pub/Sub exporter: publishes SOC-relevant spans (tool calls, prompts, risk
+  # verdicts) to GCP for central audit. Uses the glasseye-app SA key. Only
+  # receives data from the traces/soc pipeline (after filter/soc runs).
+  googlecloudpubsub:
+    project: glasseye-exp
+    topic: projects/glasseye-exp/topics/copilot-agent-audit
+    user_agent: glasseye
+  # ---- TEST OBSERVER (the only addition to upstream config.yaml) ----
+  # Mirrors the post-filter/soc stream to a local file so we can measure exactly
+  # what would be published to Pub/Sub. Nothing is removed or altered: the
+  # googlecloudpubsub exporter stays in the pipeline and still runs.
+  file/soc:
+    path: ./agent-traffic-soc.json
+
+service:
+  telemetry:
+    logs:
+      level: info
+      # The default collector logger attaches a caller stack trace to every
+      # error+ log line (DisableStacktrace: false in the built-in default).
+      # That turns a one-line bind failure into a wall of "service.New.func2 /
+      # runtime.main" frames. Disabling the stacktrace collapses fatal startup
+      # errors (port conflicts, bad config, unknown component) to a single
+      # readable line. The debug exporter's own signal output is unaffected.
+      disable_stacktrace: true
+    # By default the collector injects a Prometheus pull reader on
+    # localhost:8888 to expose its own internal metrics. An empty readers list
+    # overwrites that default, so no :8888 listener is opened — avoiding
+    # "bind: address already in use" when a second instance starts or when
+    # something else holds :8888. We don't scrape collector self-metrics
+    # locally; set level: none so the MeterProvider is a no-op too.
+    metrics:
+      level: none
+      readers: []
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]
+    traces/pubsub:
+      receivers: [otlp]
+      processors: [resource/client_addr, filter/soc, batch]
+      exporters: [googlecloudpubsub, file/soc]
+    metrics:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]
+    logs:
+      receivers: [otlp]
+      processors: [resource/client_addr, batch]
+      exporters: [debug, file]

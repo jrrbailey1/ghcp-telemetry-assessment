@@ -1,0 +1,25 @@
+# Capture artefacts - these contain verbatim prompts, source code and command
+# output from live sessions. Never commit them.
+agent-traffic*.json
+copilot-spans*
+*.xlsx
+*.csv
+~$*
+
+# OTLP JSON-lines captures under any name
+*-traffic.json
+*-capture.json
+
+# Collector build output
+glasseye
+glasseye.exe
+collector/
+
+# GCP service account keys
+*-service-account*.json
+*credentials*.json
+
+# Local scratch
+.venv/
+__pycache__/
+*.log
