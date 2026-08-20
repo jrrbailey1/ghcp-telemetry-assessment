@@ -816,60 +816,92 @@ only the latter appeared in this capture.
 - Attribute a data-access action to the specific third-party integration that performed it, with
   the full request and response payload.
 
-### `execute_hook` — code-verified, not reachable on this account
+### `execute_hook` (span) — code-verified, not reachable on this account
 
-> **Carried on:** its own dedicated `execute_hook` span — a distinct operation type, not attributes
-> bolted onto another span.
+> **Carried on:** its own dedicated `execute_hook` span — the fifth `gen_ai.operation.name` value,
+> not attributes bolted onto another span.
 > **Condition:** hooks must be configured *and* the session must run on the Claude / Copilot CLI
 > agent path. Not emitted by the default agent.
 
-A fifth `gen_ai.operation.name` value with its own span, carrying an **enforced** policy decision:
+**What it is.** A configured hook command executing against a gated agent action, recording whether
+that action was allowed or blocked. **The only enforced control event Copilot emits** — every other
+control signal in this catalogue is advisory.
 
-```
-gen_ai.operation.name          = execute_hook
-copilot_chat.hook_type         = PreToolUse | PostToolUse | PermissionRequest | ... (27 events)
-copilot_chat.hook_command      = the configured command
-copilot_chat.hook_input        = full hook stdin payload
-copilot_chat.hook_output       = hook stdout
-copilot_chat.hook_exit_code    = process exit code
-github.copilot.hook.decision   = pass | block | non_blocking_error
-github.copilot.hook.duration   = seconds
-github.copilot.hook.tool_names = JSON array of the tool being gated
-```
+**The distinguishing property.** `github.copilot.hook.decision` is a real enforcement outcome, not a
+model opinion. From the extension source: `success → pass`, **`exit_code === 2 → block`**, otherwise
+`non_blocking_error`. A `PreToolUse` hook exiting 2 **stops the tool call from running**. Contrast
+`copilotLanguageModelWrapper`, which produces a risk verdict that nothing acts on.
 
-Decision mapping, from the extension source: `success → pass`, **`exit_code === 2 → block`**,
-otherwise `non_blocking_error`. A `PreToolUse` hook exiting 2 **blocks the tool call**, so this is
-an enforcement point, not an advisory verdict.
-
-Hooks are configured through the `/hooks` slash command ("Configure Claude Code hooks for tool
-execution and events"), which writes Claude Code's schema to `.claude/settings.json`:
+**How it comes through.** Trace span, one per hook invocation, emitted on hook completion. Small —
+dominated by `hook_input`, which carries the full gated payload. Configured via the `/hooks` slash
+command ("Configure Claude Code hooks for tool execution and events"), which writes Claude Code's
+schema to `.claude/settings.json`:
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "*",
     "hooks": [ { "type": "command", "command": "…" } ] } ] } }
 ```
 
-**Testing outcome (2026-08-19): no hook telemetry could be produced.** With all three of
-`SessionStart`, `PreToolUse` and `PostToolUse` registered in the workspace, a session making three
-tool calls emitted **zero** hook attributes. The agent was `github.copilot.agent.type = builtin`.
-The emission code lives in `ClaudeMessageDispatch` beside the bundled Claude Code CLI, so coverage
-appears scoped to the Claude / Copilot CLI agent — and the test account is on **Copilot Free**,
-which provides no agent picker to reach it.
+**Quality: unverified in production form.** Attribute names and the decision mapping are read from
+source; the shape below was reproduced synthetically and confirmed to traverse the pipeline. No
+live emission was observed — see the testing outcome below.
 
-**SOC use cases (if hooks prove available on a paid tier):**
+```
+gen_ai.operation.name          = execute_hook
+copilot_chat.hook_type         = PreToolUse       (one of 27 events, incl. PermissionRequest/Denied)
+copilot_chat.hook_command      = cmd /c glasseye-policy-gate
+copilot_chat.hook_input        = {"tool_name":"run_in_terminal","tool_input":{"command":"Remove-Item -Recurse…
+copilot_chat.hook_output       = DENY: destructive filesystem operation outside workspace root
+copilot_chat.hook_result_kind  = blocked
+copilot_chat.hook_exit_code    = 2
+github.copilot.hook.decision   = block
+github.copilot.hook.duration   = 0.087
+github.copilot.hook.tool_names = ["run_in_terminal"]
+github.copilot.hook.invocation_id = 82de9e91-f785-438f-a5c0-d55620f641ed
+```
+
+**Testing outcome (2026-08-19): no live hook telemetry could be produced.** With `SessionStart`,
+`PreToolUse` and `PostToolUse` all registered in the workspace, a session making three tool calls
+emitted **zero** hook attributes; the agent was `github.copilot.agent.type = builtin`. The emission
+code sits in `ClaudeMessageDispatch` beside the bundled Claude Code CLI, so coverage appears scoped
+to the Claude / Copilot CLI agent — and the test account is **Copilot Free**, which offers no agent
+picker to reach it.
+
+### SOC use cases
+
+*Contingent on hooks proving available and covering the default agent — see caveats.*
+
+**Detection**
 - `github.copilot.hook.decision = block` — a policy control actually stopped an agent action. The
-  single most valuable control event available, and enforced rather than advisory.
-- Hooks on `PermissionRequest` / `PermissionDenied` would capture human approval decisions, which
-  is the missing H1/H2 telemetry.
-- `copilot_chat.hook_input` carries the full gated payload, so a blocked action is fully
-  reconstructable.
-- Absence of expected `execute_hook` spans on a host with hooks deployed is itself a
-  control-tampering signal.
+  highest-value control event available from Copilot, and the only enforced one.
+- Hooks registered on `PermissionRequest` / `PermissionDenied` would capture **human approval
+  decisions** — the H1/H2 telemetry absent everywhere else (see `telemetry_requirements.md` G4).
+- `decision = non_blocking_error` — the control itself failed. A hook erroring open is a silent
+  loss of enforcement, and looks identical to no policy being configured.
+- Absence of expected `execute_hook` spans on a host with hooks deployed: control tampering, or a
+  session on an agent path hooks do not cover.
+
+**Hunt**
+- Per-user ratio of `block` to `pass` over time. A user accumulating blocks is either fighting the
+  policy or probing its edges; either merits a look.
+- Repeated blocks on the same `tool_names` across many users — usually a mis-scoped policy rather
+  than an incident, and worth catching before analysts learn to ignore the alert.
+- `hook.duration` outliers: a slow hook delays every gated action and is the first thing an
+  engineer will be tempted to disable.
+
+**Investigation**
+- `copilot_chat.hook_input` carries the complete gated payload, so a blocked action is fully
+  reconstructable — you see exactly what was stopped, not merely that something was.
+- `hook_output` records the policy's own reasoning, giving the rationale alongside the decision.
+
+**Enrichment**
+- Join `hook.invocation_id` and `chat_session_id` to the corresponding `execute_tool` span to pair
+  each decision with the action it gated.
 
 > **Two caveats before designing around this.** Hook coverage may not extend to the *default*
-> agent, which would make it of limited practical value. And `execute_hook` matches none of the
-> four values in `filter/soc`, so hook decisions would be **dropped before reaching the SOC** —
-> the same blind spot as `embeddings`.
+> agent, which would make it of limited practical value in an estate where most sessions run there.
+> And `execute_hook` matches none of the four values in `filter/soc`, so hook decisions would be
+> **dropped before reaching the SOC** — the same blind spot as `embeddings`.
 
 ### Other declared attributes not observed
 
