@@ -48,6 +48,22 @@ collector.
 | `copilot_chat.session.start` | log | per session | Low–Medium | Excellent |
 | `manage_todo_list` / progressMessages / title | span | — | **None** | — |
 
+### How the SOC use cases are categorised
+
+Each signal below lists its uses under four headings. They are not interchangeable — the split
+reflects what you can realistically do with that signal:
+
+| Heading | Meaning |
+|---|---|
+| **Detection** | A rule can be written that fires on its own, without an analyst present. Needs a signal that is unambiguous in isolation. |
+| **Hunt** | **Threat hunting** — an analyst proactively searching for adversary activity that no rule has alerted on, working from a hypothesis and a baseline of normal. Used here where a finding depends on comparison against typical behaviour, so it cannot be expressed as a standalone rule. |
+| **Investigation** | Reconstructing what happened once an incident is already open. Prioritises completeness and fidelity over volume or latency. |
+| **Enrichment** | Joining this signal to another source — EDR, proxy, DNS, repository inventory, GitHub audit — to make detection or investigation possible. |
+
+A signal strong for investigation is often weak for detection, and vice versa: `panel/editAgent`
+holds the richest evidence in the feed but is far too large and too context-dependent to alert on,
+while `copilot_chat.tool.call` is near-useless for reconstruction yet ideal for a rule.
+
 ---
 
 # Tier 1 — direct detection value
