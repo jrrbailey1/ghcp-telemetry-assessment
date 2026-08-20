@@ -686,13 +686,24 @@ detection content clean and reduces analyst noise.
 
 ---
 
-# Attributes in the schema but absent from this capture
+# Conditional attributes — present only in specific circumstances
 
-Inspecting extension v0.51.0 revealed attributes that are implemented but never appeared in the
-session. Their absence is a property of **how the test was run**, not of the product — an
-important distinction, because it is easy to record a missing attribute as a missing capability.
+Source inspection of extension v0.51.0 revealed attributes that are implemented but appear only
+when particular conditions hold. Each was initially absent from a capture and initially misread as
+a missing capability — the distinction between "not emitted" and "not emitted *here*" matters.
+
+Each subsection states **which span carries the attributes**, because that determines what your
+detections can see without a join.
 
 ### Repository context — CONFIRMED PRESENT (runtime-verified, session 2)
+
+> **Carried on:** `invoke_agent` spans **only** — one per turn, on the trace root.
+> **Condition:** the workspace must be a git repository with a configured remote.
+
+No `execute_tool`, `chat`, `embeddings` or `execute_hook` span carries these. A `run_in_terminal`
+alert therefore arrives with **no repository context**; you must join back to the parent span via
+`traceId` to learn which repository the action touched. Build that join into your enrichment
+pipeline rather than discovering it mid-incident.
 
 Absent from the first capture only because that workspace had no `.git`. Re-running in a
 git-backed workspace produced them exactly as the code predicted:
@@ -714,12 +725,6 @@ github.copilot.github.org     = jrrbailey1
 Populated from the VS Code Git extension's `activeRepository`. The remote does not need to be
 reachable — the value comes from the configured fetch URL, not a successful fetch.
 
-> **Placement matters for detection engineering.** These attributes ride on the **`invoke_agent`
-> span only** — once per turn, on the root span. No `execute_tool`, `chat` or `embeddings` span
-> carries them. A `run_in_terminal` alert therefore arrives with **no repository context**; you
-> must join back to the parent via `traceId` to know which repository the action touched. Build
-> that join into your enrichment pipeline rather than discovering it mid-incident.
-
 **SOC use cases:** risk-weight every event by repository sensitivity; scope an incident to a
 specific repo, branch and commit; detect agent activity against production or regulated
 repositories; join `github.copilot.git.repository` to your repository inventory to resolve
@@ -731,12 +736,21 @@ distinguishing "not a repository" from "attribute missing". Treat absence as unk
 
 ### MCP server attribution — CONFIRMED PRESENT (runtime-verified, session 3)
 
+> **Carried on:** `execute_tool` spans — the same span type as any built-in tool call, one per
+> MCP tool invocation.
+> **Condition:** an MCP server must be configured and the agent must invoke one of its tools.
+
+Because these are ordinary `execute_tool` spans, they **already pass `filter/soc`** and reach the
+SOC feed unchanged — unlike `embeddings` and `execute_hook`. T6 detections are buildable against
+the current pipeline today.
+
 Enabling the built-in GitHub MCP server (`github.copilot.chat.githubMcpServer.enabled`) and asking
-the agent to search repositories produced a fully attributed MCP tool span:
+the agent to search repositories produced this span:
 
 ```
-gen_ai.tool.name    = mcp_github_mcp_se_search_repositories
-gen_ai.tool.type    = extension
+gen_ai.operation.name = execute_tool          <- ordinary tool span, not a distinct type
+gen_ai.tool.name      = mcp_github_mcp_se_search_repositories
+gen_ai.tool.type      = extension             <- the discriminator: builtin tools report "function"
 gen_ai.tool.call.arguments = {"query":"glasseye in:name,description,readme","page":1,"perPage":10}
 gen_ai.tool.call.result    = {"total_count":38,"items":[{"id":39622984,"full_name":"coppeliaMLA/glasseye",…
 github.copilot.tool.parameters.mcp_server_name      = github
@@ -788,6 +802,11 @@ only the latter appeared in this capture.
 
 ### `execute_hook` — code-verified, not reachable on this account
 
+> **Carried on:** its own dedicated `execute_hook` span — a distinct operation type, not attributes
+> bolted onto another span.
+> **Condition:** hooks must be configured *and* the session must run on the Claude / Copilot CLI
+> agent path. Not emitted by the default agent.
+
 A fifth `gen_ai.operation.name` value with its own span, carrying an **enforced** policy decision:
 
 ```
@@ -838,8 +857,17 @@ which provides no agent picker to reach it.
 
 ### Other declared attributes not observed
 
-`gen_ai.agent.id`, `gen_ai.agent.version`, `gen_ai.agent.description`, `gen_ai.output.type`,
-`copilot_chat.location`, `copilot_chat.intent`, `github.copilot.tool.parameters.skill_name`.
+> **Carried on:** unconfirmed. These appear in the extension's attribute constant table but never
+> in a capture, so the carrying span is inferred from naming rather than observed.
+
+| Attribute | Likely carrier (inferred) |
+|---|---|
+| `gen_ai.agent.id`, `.version`, `.description` | `invoke_agent`, alongside `gen_ai.agent.name` |
+| `gen_ai.output.type` | `chat` spans |
+| `copilot_chat.location`, `copilot_chat.intent` | `invoke_agent` or `chat` — chat entry point and classified intent |
+| `github.copilot.tool.parameters.skill_name` | `execute_tool`, for skill-invoking tools |
+
+Treat these as documented-but-unverified; confirm against your own capture before building on them.
 
 > **Method note.** Two internal sets in the extension gate the flat parameter attributes:
 > shell tools (`bash`, `powershell`, `local_shell`, `run_in_terminal`, …) populate
