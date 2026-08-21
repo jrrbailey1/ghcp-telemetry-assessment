@@ -842,15 +842,18 @@ gen_ai.system_instructions     28/28      copilot_chat.request.options   28/28
 gen_ai.response.finish_reasons 28/28      copilot_chat.request.shape     28/28
 ```
 
-**Polymorphic fields — the worst of it.** Two attributes are *sometimes* JSON and *sometimes* plain
-text, with nothing in the record to distinguish them:
+**Polymorphic fields.** Two attributes are *sometimes* JSON and *sometimes* plain text:
 
 ```
 copilot_chat.user_request      12/32 occurrences are JSON, 20 are plain prose
 gen_ai.tool.call.result         6/13 occurrences are JSON, 7 are plain text
 ```
 
-A parser that assumes either form breaks on the other. Both must be sniffed at parse time.
+A parser that assumes either form breaks on the other. The form is not random, however — measured
+across 19 samples it is **deterministic by agent**: `panel/editAgent` always emits the JSON array
+form of `user_request`, every other agent always emits plain text. Branching on
+`gen_ai.agent.name` therefore works, but the correlation is undocumented and could change with any
+release, so sniff the first non-whitespace character as well. See §9.4 step 5.
 
 **Internal serialisation in `tool.call.result`.** The JSON form is VS Code's render tree with
 minified class names (`_Me`, `wn`, `y6e`, `fk`) that change between builds. Recovering the actual
@@ -874,29 +877,316 @@ occurring. Derive tool counts from `copilot_chat.tool.call` events instead.
 
 ### 9.4 Required normalisation pipeline
 
-In order. Steps 1–6 are mandatory for the data to be usable at all.
+Eleven steps, in order. Steps 1–6 are mandatory — without them the data is not queryable at all.
+Steps 7–11 determine whether it is affordable and useful.
 
-1. **Flatten** `resourceSpans → scopeSpans → spans` to one record per event, merging resource
-   attributes onto each.
-2. **Project** the `{key,value}` attribute arrays into flat fields.
-3. **Coerce types** — `intValue` strings to numbers, nanosecond epochs to ISO-8601.
-4. **Unwrap** `arrayValue` structures to plain arrays.
-5. **Decode** the eleven double-encoded attributes, sniffing type on the two polymorphic ones.
-6. **Extract text** from render-tree tool results.
-7. **Strip static bloat** — dropping `gen_ai.tool.definitions` and `gen_ai.system_instructions`, or
-   emitting them once per session, removes **76% of span payload** (589 KB of 775 KB measured) and
-   brings every remaining document under typical field limits. This single step resolves most of
-   §9.2.
-8. **Derive severity** — a defensible mapping is `execute_hook` with `decision=block` → high;
-   `run_in_terminal` and `fetch_webpage` → medium; everything else → informational.
-9. **Enrich identity** — `enduser.id` and `host.name` (G1, G2); repository context is only on
-   `invoke_agent`, so join child spans to the parent via `traceId` (G8).
-10. **Normalise tool parameters** for the tools GitHub gave no flat attribute — `fetch_webpage`,
-    `github_repo`, `install_extension`, `run_vscode_command` — so detection coverage does not
-    depend on which tools happened to get convenience fields (G18).
-11. **Route large content separately.** Keep prompts and file contents in object storage keyed by
-    `traceId`/`spanId`, and index only a pointer plus a hash. Preserves investigative access
-    without paying per-GB SIEM ingest on 100 KB fields.
+A working reference implementation of steps 1–6 is `tools/flatten.ps1`.
+
+---
+
+#### Step 1 — Flatten the three-level nesting
+
+**Why.** Events are buried four levels deep and one line carries a whole batch. A SIEM ingesting
+line-by-line sees one enormous record, not the twelve events inside it. Nothing is queryable until
+each span becomes its own record.
+
+**Before** — one line, two events:
+
+```json
+{"resourceSpans":[{
+  "resource":{"attributes":[{"key":"service.name","value":{"stringValue":"copilot-chat"}}]},
+  "scopeSpans":[{"scope":{"name":"copilot-chat","version":"0.51.0"},
+    "spans":[ {"spanId":"aaa…","name":"execute_tool read_file", …},
+              {"spanId":"bbb…","name":"execute_tool run_in_terminal", …} ]}]}]}
+```
+
+**After** — two records. Iterate `resourceSpans[] → scopeSpans[] → spans[]` and emit one per span.
+
+**Gotcha.** Resource attributes live in a *different branch* from span attributes. They must be
+copied onto every record during this pass, or you lose `service.name`, `session.id` and any
+identity enrichment added by the collector. This is the single most common mistake.
+
+---
+
+#### Step 2 — Project the attribute arrays into fields
+
+**Why.** OTLP stores attributes as an *array of key/value objects*, not as an object. No SIEM can
+index or search `attributes[7].value.stringValue` in any useful way — you cannot write a rule
+against a field whose position varies per record.
+
+**Before:**
+
+```json
+"attributes":[
+  {"key":"gen_ai.operation.name","value":{"stringValue":"execute_tool"}},
+  {"key":"gen_ai.tool.name","value":{"stringValue":"run_in_terminal"}}]
+```
+
+**After:**
+
+```json
+{"gen_ai.operation.name":"execute_tool","gen_ai.tool.name":"run_in_terminal"}
+```
+
+**Gotcha.** Decide early whether to keep dots in field names or convert to nesting. Dots are closer
+to the semantic convention and easier to map back to the spec; nesting suits Elasticsearch better.
+Pick one and hold it — mixed conventions across sources make correlation queries miserable.
+
+---
+
+#### Step 3 — Coerce types
+
+**Why.** Two problems, both silent. Per the proto3 JSON mapping, **64-bit integers are serialised as
+quoted strings**, so token counts and durations arrive as text. A SIEM will happily index them as
+strings, and every numeric comparison — thresholds, sums, averages — then fails or returns nothing.
+And nanosecond epochs are not auto-detected as timestamps by any platform I am aware of, so records
+land with ingest time rather than event time.
+
+**Before** (verbatim from the capture):
+
+```json
+"gen_ai.usage.input_tokens","value":{"intValue":"268"}
+"startTimeUnixNano":"1787051419912000000"
+```
+
+**After:**
+
+```json
+"gen_ai.usage.input_tokens": 268
+"@timestamp": "2026-08-18T11:10:19.912Z"
+```
+
+**Gotcha.** Divide nanoseconds by 1,000,000 for milliseconds — do not parse the nanosecond value as
+seconds, which silently yields a date tens of thousands of years in the future and is usually
+noticed only when someone queries a time range and gets nothing.
+
+---
+
+#### Step 4 — Unwrap array values
+
+**Why.** Arrays arrive wrapped in two layers of OTLP type envelopes. Left as-is, a rule matching
+`finish_reasons == "content_filter"` never fires, because the field is an object, not a string.
+This directly breaks one of the recommended detections in §9.
+
+**Before:**
+
+```json
+"gen_ai.response.finish_reasons":{"arrayValue":{"values":[{"stringValue":"stop"}]}}
+```
+
+**After:**
+
+```json
+"gen_ai.response.finish_reasons":["stop"]
+```
+
+---
+
+#### Step 5 — Decode the double-encoded content
+
+**Why.** Eleven attributes carry a complete JSON document *inside* a string value. Without a second
+parse the field is one opaque blob: you cannot query the role of a message, count the parts, or
+extract the text. Secret-scanning against the raw string also produces false negatives, because
+escaping (`\"`, `\n`) breaks pattern matches that would hit the decoded text.
+
+**Before:**
+
+```json
+"gen_ai.output.messages":"[{\"role\":\"assistant\",\"parts\":[{\"type\":\"text\",
+   \"content\":\"{\\\"risk\\\": \\\"green\\\", \\\"explanation\\\": \\\"Changes directory…\\\"}\"}]}]"
+```
+
+Note that is **triple**-encoded: an OTLP string, containing a messages array, containing a JSON
+risk verdict.
+
+**After:**
+
+```json
+"output.role":"assistant",
+"output.text":"{\"risk\":\"green\",\"explanation\":\"Changes directory and executes hello.py.\"}",
+"risk.verdict":"green"
+```
+
+**Gotcha — the polymorphic fields.** `copilot_chat.user_request` and `gen_ai.tool.call.result` are
+*sometimes* JSON and *sometimes* plain prose. A parser assuming either form breaks on the other.
+
+Measured across 19 samples, the form is **deterministic by agent**, not random:
+
+| `gen_ai.agent.name` | `copilot_chat.user_request` form |
+|---|---|
+| `panel/editAgent` | **always** a JSON array of `{"type":"input_text","text":…}` |
+| `GitHub Copilot Chat`, `title`, `progressMessages`, `copilotLanguageModelWrapper` | **always** plain text |
+
+So you *can* branch on agent name — but sniff the first non-whitespace character anyway
+(`[` or `{` → parse, else treat as text). The correlation is undocumented and could change with any
+release; sniffing costs nothing and does not.
+
+---
+
+#### Step 6 — Extract text from render-tree tool results
+
+**Why.** `gen_ai.tool.call.result` for file tools returns VS Code's internal prompt-render tree
+rather than the file content. The content is there, scattered across `text` nodes several levels
+down. Without extraction, the most investigatively valuable field in the feed — what the agent
+actually read — is an unreadable blob.
+
+**Before:**
+
+```json
+{"node":{"type":1,"ctor":2,"ctorName":"_Me","children":[{"type":1,"ctor":2,"ctorName":"wn",
+ "children":[{"type":2,"priority":15,"text":"# Glasseye E2E Sandbox\n",
+ "references":[{"anchor":{"fsPath":"c:\\…\\README.md"}}]}]}]}}
+```
+
+**After:**
+
+```json
+"tool.result.text":"# Glasseye E2E Sandbox\n…",
+"tool.result.files":["c:\\…\\README.md"]
+```
+
+**Gotcha.** Walk the tree collecting any property named `text`; **never** match on `ctorName`.
+Those values (`_Me`, `wn`, `y6e`) are minifier output, reassigned whenever the bundle is rebuilt, so
+a parser keyed on them silently stops matching after a VS Code upgrade. `text` and `fsPath` are
+author-chosen data keys and survive minification.
+
+---
+
+#### Step 7 — Strip the static bloat *(the highest-value step)*
+
+**Why.** `gen_ai.tool.definitions` and `gen_ai.system_instructions` are effectively constant per
+session and account for **76%** of all span payload (589 KB of 775 KB measured; `tool.definitions`
+alone averages 81,814 characters per `panel/editAgent` span). Removing them brings every remaining
+document under the platform limits in §9.2 and cuts ingest cost by roughly four times.
+
+**How.** Emit both **once per session**, keyed on `session.id`, and replace them on individual spans
+with a hash:
+
+```json
+"gen_ai.tool.definitions.sha256":"9f2c…",
+"gen_ai.system_instructions.sha256":"41ab…"
+```
+
+This preserves both security uses — the tool inventory (capability envelope, MCP servers present)
+and change detection on the system prompt — at 64 bytes instead of 107,000.
+
+**Gotcha.** Do not simply drop them. `tool.definitions` is the only enumeration of what the agent
+*could* do, and a change in the system prompt between sessions is a governance signal. Hash, store
+once, reference.
+
+---
+
+#### Step 8 — Derive severity
+
+**Why.** All 57 log records carry empty `severityText` and `severityNumber`. Most SIEM triage
+workflows, dashboards and alert routing key on severity, so everything arrives as an undifferentiated
+mass unless you assign it.
+
+**A defensible starting mapping:**
+
+| Condition | Severity |
+|---|---|
+| `execute_hook` with `hook.decision = block` | high |
+| `execute_tool` where tool is `run_in_terminal` or `fetch_webpage` | medium |
+| `execute_tool` writing to a file (`edit_type` present) | medium |
+| `finish_reasons` contains `content_filter` | medium |
+| `embeddings` with `input_count` above baseline | low |
+| everything else | informational |
+
+**Gotcha.** Severity is a routing decision, not a truth claim — tune it against your own alert
+volume rather than treating the table above as settled.
+
+---
+
+#### Step 9 — Enrich identity and repository context
+
+**Why.** Two distinct problems. Copilot emits **no user or host identity at all** (G1, G2), so
+records cannot be attributed. And repository attributes ride on `invoke_agent` **only** (G8), so a
+`run_in_terminal` alert arrives without knowing which repository it touched.
+
+**How.**
+
+```
+enduser.id, host.name  ← injected by the collector or via OTEL_RESOURCE_ATTRIBUTES
+github.copilot.git.*   ← looked up from the parent invoke_agent span, joined on traceId
+```
+
+**Gotcha.** The repository join is *backwards in time*: `invoke_agent` closes at end of turn, up to
+431 seconds **after** its children. A streaming enrichment that expects the parent first will find
+nothing. Either buffer child spans until the parent arrives, or enrich retrospectively on a short
+delay.
+
+---
+
+#### Step 10 — Normalise tool parameters
+
+**Why.** Copilot populates the convenient flat attributes for only 6 shell tools and 22 file tools.
+Everything else — including `fetch_webpage`, `github_repo`, `install_extension`,
+`run_vscode_command`, `runSubagent` — carries only the raw JSON blob (G18). Detection coverage
+should not depend on which tools GitHub happened to add convenience fields for.
+
+**Before** (`fetch_webpage` — no flat attribute exists):
+
+```json
+"gen_ai.tool.call.arguments":"{\"urls\":[\"https://raw.githubusercontent.com/…/README.md\"],
+                                \"query\":\"README content summary\"}"
+```
+
+**After** — project into a consistent shape across all tools:
+
+```json
+"tool.target":"https://raw.githubusercontent.com/…/README.md",
+"tool.target_type":"url"
+```
+
+**Gotcha.** Also re-derive `tool.parameters.command` from `gen_ai.tool.call.arguments` rather than
+trusting the flat attribute, which is **silently truncated at 256 characters** and evadable by
+padding (G18).
+
+---
+
+#### Step 11 — Route large content separately
+
+**Why.** Even after step 7, `gen_ai.input.messages` averages 27,573 characters and peaks at 56,435.
+Indexing that per event is expensive and rarely queried — you need it during an investigation, not
+in every dashboard.
+
+**How.** Write the large content fields to object storage keyed by `traceId`/`spanId`; index a
+pointer, a size and a hash:
+
+```json
+"content.ref":"s3://copilot-telemetry/2026/08/18/3b4a34bb…/909b5c30….json",
+"content.bytes":56435,
+"content.sha256":"7d21…"
+```
+
+**Gotcha.** Run secret and PII scanning **before** the split, on the decoded text, and index the
+*verdict*. Otherwise the detection that matters most requires fetching from cold storage, and it
+will not run at ingest speed.
+
+---
+
+#### Target output schema
+
+The record a SIEM should actually receive, after all eleven steps:
+
+```json
+{ "@timestamp":"2026-08-18T11:10:19.912Z", "duration_ms":7983, "severity":"medium",
+  "enduser.id":"jrrbailey1", "host.name":"BIFROST",
+  "trace.id":"3b4a34bb…", "span.id":"909b5c30…", "parent.span.id":"…",
+  "session.id":"6fecb406…", "turn.index":4,
+  "operation":"execute_tool", "agent.name":"GitHub Copilot Chat", "tool.name":"run_in_terminal",
+  "tool.type":"function",
+  "git.repository":"https://github.com/org/repo.git", "git.branch":"main", "git.commit":"1f21a83…",
+  "tool.target":"cd /d \"…\" && python.exe hello.py", "tool.target_type":"command",
+  "tool.result.text":"Glasseye E2E Sandbox", "tool.success":true,
+  "usage.input_tokens":112335, "usage.output_tokens":1785,
+  "model.request":"claude-haiku-4.5", "model.response":"claude-haiku-4-5-20251001",
+  "content.ref":"s3://…", "content.sha256":"7d21…", "secrets.verdict":"clean" }
+```
+
+Roughly 1 KB per event, fully typed, every field queryable — against a raw input averaging 13 KB
+and peaking at 656 KB.
 
 ### 9.5 Effort assessment
 
